@@ -511,6 +511,7 @@ async def render_image(ctx: Context, file_path: str = "render.png") -> str:
 
 def main():
     """Run the MCP server."""
+    global _ollama_url, _ollama_model
     parser = argparse.ArgumentParser(description="BlenderMCP Server")
     parser.add_argument("--ollama-url", type=str, default=_ollama_url,
                         help="URL of the Ollama server")
@@ -524,7 +525,6 @@ def main():
     args = parser.parse_args()
 
     # Set global variables from command-line arguments
-    global _ollama_url, _ollama_model
     _ollama_url = args.ollama_url
     _ollama_model = args.ollama_model
 

@@ -105,18 +105,41 @@ Interact with `blender-open-mcp` using the `mcp` command-line tool:
   ```bash
   mcp prompt "Hello BlenderMCP!" --host http://localhost:8000
   ```
+  - **Expected result:** The AI model should process this. The output will be a JSON response from the model, often containing a conversational reply or an attempt to interpret it as a command. For a simple greeting, it might be something like:
+    ```json
+    {"type": "assistant_message", "content": "Hello there! How can I help you with Blender today?"}
+    ```
+    (The exact output depends on the LLM model's response).
 
 - **Get Scene Information:**
 
   ```bash
   mcp tool get_scene_info --host http://localhost:8000
   ```
+  - **Expected result:** A JSON output detailing the current scene in Blender, including objects, their types, locations, etc. For example:
+    ```json
+    {
+      "name": "Scene",
+      "object_count": 3,
+      "objects": [
+        { "name": "Cube", "type": "MESH", "location": [0.0, 0.0, 0.0] },
+        { "name": "Light", "type": "LIGHT", "location": [4.07, 1.01, 5.9]}
+        // ... more objects
+      ],
+      "materials_count": 1
+    }
+    ```
+    (The actual content will vary based on the scene.)
 
 - **Create a Cube:**
 
   ```bash
   mcp prompt "Create a cube named 'my_cube'." --host http://localhost:8000
   ```
+  - **Expected result:** The AI model will interpret this and use the `create_object` tool. A new cube named "my_cube" should appear in the Blender scene. The command output will likely be a JSON response confirming the action, e.g.,
+    ```json
+    {"type": "tool_response", "tool_name": "create_object", "content": "Created CUBE object: my_cube"}
+    ```
 
 - **Render an Image:**
 
@@ -158,6 +181,7 @@ If you encounter issues:
 - Check Blender’s add-on settings.
 - Verify command-line arguments.
 - Refer to logs for error details.
+- Ensure the `mcp` command-line tool is working correctly. After installation, you can test it with `mcp --version`. If the `mcp` command is not found, or subcommands like `prompt` are missing, please check your Python environment's script PATH or try reinstalling the package (`uv pip install --force-reinstall blender-open-mcp`).
 
 For further assistance, visit the [GitHub Issues](https://github.com/dhakalnirajan/blender-open-mcp/issues) page.
 
