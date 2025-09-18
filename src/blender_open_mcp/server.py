@@ -186,7 +186,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Initialize MCP server instance globally
 mcp = FastMCP(
     "BlenderOpenMCP",
-    description="Blender integration with local AI models via Ollama",
     lifespan=server_lifespan
 )
 
@@ -497,21 +496,32 @@ async def get_ollama_models(ctx: Context) -> str:
 async def render_image(ctx: Context, file_path: str = "render.png") -> str:
     try:
         blender = get_blender_connection()
-        result = blender.send_command("render_scene", {"output_path":file_path})
-        if result:
+        result = blender.send_command("render_scene", {"output_path": file_path})
+        if result and result.get("rendered"):
+            # Use the actual output path returned from Blender
+            actual_file_path = result.get("output_path")
+            if not actual_file_path:
+                return "Error: Blender rendered but did not return an output path."
             try:
-                with open(file_path, "rb") as image_file:
+                with open(actual_file_path, "rb") as image_file:
                     encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                    ctx.add_image(Image(data=encoded_string)) # Add image to the context
+                    ctx.add_image(Image(data=encoded_string))  # Add image to the context
                     return "Image Rendered Successfully."
+            except FileNotFoundError:
+                return f"Error: Blender rendered to '{actual_file_path}', but the file was not found by the server."
             except Exception as exception:
-                return f"Blender rendered, however image could not be found. {exception!s}" # Use exception
+                return f"Blender rendered, but the image could not be read: {exception!s}"
+        else:
+            return f"Error: Rendering failed with result: {result}"
     except Exception as e:
         return f"Error: {e!s}"
 
 def main():
     """Run the MCP server."""
     parser = argparse.ArgumentParser(description="BlenderMCP Server")
+    # Set global variables from command-line arguments
+    global _ollama_url, _ollama_model
+
     parser.add_argument("--ollama-url", type=str, default=_ollama_url,
                         help="URL of the Ollama server")
     parser.add_argument("--ollama-model", type=str, default=_ollama_model,
@@ -523,8 +533,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Set global variables from command-line arguments
-    global _ollama_url, _ollama_model
     _ollama_url = args.ollama_url
     _ollama_model = args.ollama_model
 
