@@ -482,13 +482,15 @@ class BlenderMCPServer:
                     file_info = files_data["hdri"][resolution][file_format]
                     file_url = file_info["url"]
 
-                    with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
-                        response = requests.get(file_url)
-                        if response.status_code != 200:
-                            return {"error": f"Failed to download HDRI: {response.status_code}"}
-                        tmp_file.write(response.content)
-                        tmp_path = tmp_file.name
+                    tmp_path = None
                     try:
+                        with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as tmp_file:
+                            response = requests.get(file_url)
+                            if response.status_code != 200:
+                                return {"error": f"Failed to download HDRI: {response.status_code}"}
+                            tmp_file.write(response.content)
+                            tmp_path = tmp_file.name
+
                         if not bpy.data.worlds:
                             bpy.data.worlds.new("World")
                         world = bpy.data.worlds[0]
@@ -525,10 +527,7 @@ class BlenderMCPServer:
                         node_tree.links.new(background.outputs['Background'], output.inputs['Surface'])
 
                         bpy.context.scene.world = world
-                        try:
-                            tempfile._cleanup()
-                        except:
-                            pass
+
                         return {
                             "success": True,
                             "message": f"HDRI {asset_id} imported successfully",
@@ -536,6 +535,9 @@ class BlenderMCPServer:
                         }
                     except Exception as e:
                         return {"error": f"Failed to set up HDRI: {str(e)}"}
+                    finally:
+                        if tmp_path and os.path.exists(tmp_path):
+                            os.remove(tmp_path)
                 else:
                     return {"error": f"Resolution/format unavailable."}
 
