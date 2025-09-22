@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/dhakalnirajan-blender-open-mcp-badge.png)](https://mseep.ai/app/dhakalnirajan-blender-open-mcp)
+
 # blender-open-mcp
 
 `blender-open-mcp` is an open source project that integrates Blender with local AI models (via [Ollama](https://ollama.com/)) using the Model Context Protocol (MCP). This allows you to control Blender using natural language prompts, leveraging the power of AI to assist with 3D modeling tasks.
