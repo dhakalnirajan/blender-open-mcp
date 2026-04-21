@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/dhakalnirajan-blender-open-mcp-badge.png)](https://mseep.ai/app/dhakalnirajan-blender-open-mcp)
+
 # blender-open-mcp
 
 **Open Models MCP for Blender3D using Ollama**
