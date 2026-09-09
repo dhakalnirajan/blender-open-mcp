@@ -39,11 +39,26 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 - `_server_loop()` binds a TCP socket (default `localhost:9876`) and accepts
   connections in daemon threads.
 - `_handle_client()` reads until `\n`, parses JSON, and calls `_dispatch()`.
-- `_dispatch()` looks up `HANDLERS[type]`, runs the handler, and returns
-  `_ok(result)` / `_err(message)` as newline-terminated JSON.
-- Handlers run directly (threaded). Blender operator execution (`bpy.ops`) is
-  invoked inside handlers; the panel/operator layer drives the server lifecycle
-  from the UI thread.
+- `_dispatch()` looks up `HANDLERS[type]`, runs the handler **on Blender's main
+  thread** (see below), and returns `_ok(result)` / `_err(message)` as
+  newline-terminated JSON.
+- **Thread model.** Connections are accepted on daemon threads, but `bpy` is not
+  thread safe: `bpy.ops.*` needs a window/view-layer context that only exists on
+  the main thread, and a worker thread instead sees a restricted context
+  (`'Context' object has no attribute 'active_object'`). So handlers are
+  marshalled: `_run_on_main_thread()` queues a `_MainThreadJob`, the
+  `_main_thread_pump()` `bpy.app.timers` callback drains the queue on the main
+  thread, and the worker blocks on a `threading.Event` until the result (or
+  exception) returns. The pump is registered by `BLENDER_MCP_OT_StartServer` and
+  torn down by `BLENDER_MCP_OT_StopServer` / `unregister()`, which also releases
+  any jobs still waiting.
+- Commands in `WORKER_THREAD_COMMANDS` (PolyHaven lookups, LLM passthrough
+  stubs) touch no `bpy` and deliberately stay on the worker thread so blocking
+  network I/O never freezes Blender's UI. `download_polyhaven_asset` is in that
+  set and marshals only its `bpy` import step.
+- If no live pump is detected (bpy mocked in unit tests, or `_server_loop`
+  started directly), `_run_on_main_thread()` falls back to running inline rather
+  than deadlocking.
 - `HANDLERS` currently includes: get_scene_info, get_object_info,
   create_object, modify_object, delete_object, set_material, render_image,
   execute_blender_code, get_polyhaven_categories, search_polyhaven_assets,
@@ -53,6 +68,10 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 
 ### MCP server (`src/blender_open_mcp/server.py`)
 - FastMCP instance named `blender_open_mcp`.
+- `_send_blender_command()` frames responses on the protocol's newline
+  terminator rather than waiting for EOF, so a crash mid-reply is distinguished
+  from a clean close; `ConnectionResetError` / `BrokenPipeError` surface as an
+  actionable "Blender reset the connection" message instead of a raw traceback.
 - **Blender tools** forward to the add-on via `_send_blender_command()`:
   - scene: `blender_get_scene_info`, `blender_get_object_info`
   - objects: `blender_create_object`, `blender_modify_object`,
@@ -119,9 +138,11 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 1. Agent calls `blender_create_object(primitive_type="SPHERE", ...)`.
 2. Server tool builds `cmd_params` and calls `_send_blender_command()`.
 3. A TCP connection sends `{"type": "create_object", "params": {...}}\n`.
-4. `addon.py` reads the line, `_dispatch()` runs the handler, bpy creates the
-   object, and the response `{"status":"ok","result":{...}}` is returned.
-5. The server formats the result and returns a string to the MCP client.
+4. `addon.py` reads the line and `_dispatch()` queues the handler for Blender's
+   main thread; the pump runs it, bpy creates the object, and the worker thread
+   wakes with the result.
+5. The response `{"status":"ok","result":{...}}\n` is written back; the bridge
+   reads up to the newline and returns a formatted string to the MCP client.
 
 ## Data flow — AI prompt
 
@@ -158,6 +179,11 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
   boots the real `addon.py` TCP loop on a local port to round-trip bridge
   commands (`blender_get_scene_info`, `blender_execute_code`) over a real
   socket with bpy mocked.
+- `tests/test_addon.py::TestMainThreadDispatch` covers the marshalling
+  contract: jobs execute on the pump thread rather than the caller, exceptions
+  propagate back to the requesting thread, `WORKER_THREAD_COMMANDS` stay off the
+  main thread, stopping the pump releases blocked workers, and a missing pump
+  degrades to inline execution instead of deadlocking.
 
 ## Known gaps / notes
 - Runtime tests mock Blender and providers; a real Blender end-to-end pass is

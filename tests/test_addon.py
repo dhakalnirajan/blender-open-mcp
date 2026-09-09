@@ -7,6 +7,8 @@ LLM backends and runtime provider switching. These tests reflect that.
 
 import sys
 import os
+import threading
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -212,3 +214,153 @@ class TestAddonPolyHaven(unittest.TestCase):
         result = addon.handle_search_polyhaven_assets({"asset_type": "textures"})
         self.assertEqual(result["total"], 2)
         self.assertEqual(len(result["assets"]), 2)
+
+
+class TestMainThreadDispatch(unittest.TestCase):
+    """bpy work must be marshalled to Blender's main thread (see _dispatch).
+
+    Regression cover for the add-on running every handler on the per-connection
+    worker thread, which gave bpy.ops a restricted context
+    ("'Context' object has no attribute 'active_object'") and destabilised
+    renders.
+    """
+
+    def setUp(self):
+        addon._pump_registered = False
+        addon._pump_verified = False
+        while not addon._main_thread_jobs.empty():
+            addon._main_thread_jobs.get_nowait()
+
+    tearDown = setUp
+
+    def _run_pump_until(self, stop_event):
+        """Stand in for bpy.app.timers draining the queue on the main thread."""
+        while not stop_event.is_set():
+            addon._main_thread_pump()
+            time.sleep(0.005)
+
+    def test_runs_inline_when_no_pump(self):
+        """Headless/mocked bpy has no timer pump: never block, run inline."""
+        caller = threading.current_thread().ident
+        seen = {}
+
+        def job():
+            seen["thread"] = threading.current_thread().ident
+            return "done"
+
+        result = []
+        t = threading.Thread(target=lambda: result.append(addon._run_on_main_thread(job)))
+        t.start()
+        t.join(timeout=5.0)
+
+        self.assertEqual(result, ["done"])
+        self.assertNotEqual(seen["thread"], caller)  # ran on the worker itself
+
+    def test_job_runs_on_pump_thread_not_caller(self):
+        """With a live pump, the handler executes on the pump thread."""
+        addon._pump_registered = True
+        stop = threading.Event()
+        pump = threading.Thread(target=self._run_pump_until, args=(stop,), daemon=True)
+        pump.start()
+
+        seen = {}
+
+        def job():
+            seen["thread"] = threading.current_thread().ident
+            return 42
+
+        out = []
+        worker = threading.Thread(target=lambda: out.append(addon._run_on_main_thread(job)))
+        worker.start()
+        worker.join(timeout=5.0)
+        stop.set()
+        pump.join(timeout=2.0)
+
+        self.assertEqual(out, [42])
+        self.assertEqual(seen["thread"], pump.ident)
+
+    def test_exception_propagates_to_caller(self):
+        """Errors raised on the main thread surface in the requesting thread."""
+        addon._pump_registered = True
+        stop = threading.Event()
+        pump = threading.Thread(target=self._run_pump_until, args=(stop,), daemon=True)
+        pump.start()
+
+        def boom():
+            raise ValueError("kaboom")
+
+        captured = []
+
+        def worker():
+            try:
+                addon._run_on_main_thread(boom)
+            except Exception as exc:  # noqa: BLE001
+                captured.append(exc)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=5.0)
+        stop.set()
+        pump.join(timeout=2.0)
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsInstance(captured[0], ValueError)
+        self.assertIn("kaboom", str(captured[0]))
+
+    def test_bpy_commands_are_marshalled_worker_safe_are_not(self):
+        """create_object goes to the main thread; PolyHaven lookups do not."""
+        addon._pump_registered = True
+        stop = threading.Event()
+        pump = threading.Thread(target=self._run_pump_until, args=(stop,), daemon=True)
+        pump.start()
+
+        threads = {}
+
+        def spy(name):
+            def handler(_params):
+                threads[name] = threading.current_thread().ident
+                return {"ok": name}
+            return handler
+
+        originals = {k: addon.HANDLERS[k] for k in ("create_object", "get_polyhaven_categories")}
+        addon.HANDLERS["create_object"] = spy("create_object")
+        addon.HANDLERS["get_polyhaven_categories"] = spy("polyhaven")
+        try:
+            def worker():
+                addon._dispatch("create_object", {})
+                addon._dispatch("get_polyhaven_categories", {})
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(timeout=5.0)
+            worker_id = t.ident
+        finally:
+            addon.HANDLERS.update(originals)
+            stop.set()
+            pump.join(timeout=2.0)
+
+        self.assertEqual(threads["create_object"], pump.ident)
+        self.assertEqual(threads["polyhaven"], worker_id)
+
+    def test_stop_pump_releases_pending_jobs(self):
+        """Stopping the server must not leave worker threads blocked forever."""
+        addon._pump_registered = True
+        addon._pump_verified = True
+
+        captured = []
+
+        def worker():
+            try:
+                addon._run_on_main_thread(lambda: "never")
+            except Exception as exc:  # noqa: BLE001
+                captured.append(exc)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(0.1)  # let it enqueue and block
+        addon._stop_main_thread_pump()
+        t.join(timeout=5.0)
+
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(captured), 1)
+        self.assertIn("stopped", str(captured[0]).lower())

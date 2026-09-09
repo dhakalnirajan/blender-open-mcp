@@ -27,11 +27,13 @@ import bpy
 import json
 import math
 import os
+import queue
 import socket
 import threading
+import time
 import traceback
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,14 @@ DEFAULT_PORT = 9876
 SOCKET_TIMEOUT = 60.0
 RECV_BUFFER = 8192
 
+# How often the main-thread pump drains the job queue (seconds).
+MAIN_THREAD_POLL_INTERVAL = 0.05
+# How long a worker thread waits for a main-thread job before giving up.
+# Generous: a single render or heavy bpy build can legitimately take minutes.
+MAIN_THREAD_JOB_TIMEOUT = 600.0
+# Grace period for the pump to prove it is ticking after the server starts.
+MAIN_THREAD_PUMP_GRACE = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Global server state
@@ -49,6 +59,23 @@ RECV_BUFFER = 8192
 _server_socket: Optional[socket.socket] = None
 _server_thread: Optional[threading.Thread] = None
 _server_running = False
+
+# ---------------------------------------------------------------------------
+# Main-thread job pump
+#
+# The TCP server accepts connections on daemon threads, but the Blender Python
+# API is not thread safe: bpy.ops.* in particular requires a valid window /
+# view-layer context that only exists on Blender's main thread. Calling it from
+# a worker thread yields a restricted context ("'Context' object has no
+# attribute 'active_object'") and can destabilise the process during renders.
+#
+# Worker threads therefore hand bpy work to _run_on_main_thread(), which queues
+# a job for a bpy.app.timers callback running on the main thread and blocks
+# until the result (or exception) comes back.
+# ---------------------------------------------------------------------------
+_main_thread_jobs: "queue.Queue[_MainThreadJob]" = queue.Queue()
+_pump_registered = False
+_pump_verified = False  # set True by the pump's first real tick
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +94,125 @@ def _vec3_from_list(lst, default=(0.0, 0.0, 0.0)):
     if lst and len(lst) >= 3:
         return tuple(float(v) for v in lst[:3])
     return default
+
+
+# ---------------------------------------------------------------------------
+# Main-thread execution
+# ---------------------------------------------------------------------------
+
+class _MainThreadJob:
+    """A callable queued for execution on Blender's main thread."""
+
+    __slots__ = ("fn", "done", "result", "error")
+
+    def __init__(self, fn: Callable[[], Any]):
+        self.fn = fn
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        try:
+            self.result = self.fn()
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller
+            self.error = exc
+        finally:
+            self.done.set()
+
+
+def _main_thread_pump() -> float:
+    """bpy.app.timers callback: drain queued jobs on Blender's main thread."""
+    global _pump_verified
+    _pump_verified = True
+    while True:
+        try:
+            job = _main_thread_jobs.get_nowait()
+        except queue.Empty:
+            break
+        job.run()
+    return MAIN_THREAD_POLL_INTERVAL
+
+
+def _start_main_thread_pump() -> None:
+    """Register the main-thread pump. Must be called from the main thread."""
+    global _pump_registered, _pump_verified
+    if _pump_registered:
+        return
+    _pump_verified = False
+    bpy.app.timers.register(_main_thread_pump, persistent=True)
+    _pump_registered = True
+
+
+def _stop_main_thread_pump() -> None:
+    """Unregister the pump and fail any jobs still waiting."""
+    global _pump_registered, _pump_verified
+    if _pump_registered:
+        try:
+            bpy.app.timers.unregister(_main_thread_pump)
+        except (ValueError, TypeError):
+            pass  # already gone
+        _pump_registered = False
+    _pump_verified = False
+    while True:
+        try:
+            job = _main_thread_jobs.get_nowait()
+        except queue.Empty:
+            break
+        job.error = RuntimeError("MCP server stopped before the job could run.")
+        job.done.set()
+
+
+def _pump_is_live() -> bool:
+    """True when a real bpy.app.timers pump is draining the queue.
+
+    Falls back to False when Blender's timer system isn't actually running
+    (unit tests with bpy mocked, or the server started without the operator),
+    so callers can execute inline instead of blocking forever.
+    """
+    if _pump_verified:
+        return True
+    if not _pump_registered:
+        return False
+    # Registered but not yet observed ticking: give it a moment to prove itself.
+    deadline = time.monotonic() + MAIN_THREAD_PUMP_GRACE
+    while time.monotonic() < deadline:
+        if _pump_verified:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _run_on_main_thread(fn: Callable[[], Any]) -> Any:
+    """Run ``fn`` on Blender's main thread and return its result.
+
+    Exceptions raised by ``fn`` are re-raised in the calling thread.
+    """
+    if threading.current_thread() is threading.main_thread():
+        return fn()
+    if not _pump_is_live():
+        # No live pump: run inline rather than deadlock. Blender's own UI thread
+        # is not involved here, so this is the historical (unsafe) behaviour,
+        # kept only for headless/mocked contexts.
+        return fn()
+
+    job = _MainThreadJob(fn)
+    _main_thread_jobs.put(job)
+
+    # Wait in slices so a pump shut down after we enqueued doesn't strand us
+    # here for the full timeout.
+    deadline = time.monotonic() + MAIN_THREAD_JOB_TIMEOUT
+    while not job.done.wait(0.1):
+        if not _pump_registered:
+            raise RuntimeError("MCP server stopped before the job could run.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Blender did not execute the command within "
+                f"{MAIN_THREAD_JOB_TIMEOUT}s. The main thread may be blocked by a "
+                "modal operator or a long render."
+            )
+    if job.error is not None:
+        raise job.error
+    return job.result
 
 
 # ---------------------------------------------------------------------------
@@ -365,23 +511,27 @@ def handle_download_polyhaven_asset(params: Dict) -> Any:
     dest = os.path.join(tmp_dir, f"{asset_id}_{resolution}.{ext}")
     urllib.request.urlretrieve(download_url, dest)
 
-    # Import based on type
+    # Import based on type. The download above ran on the worker thread; the
+    # bpy work below must happen on Blender's main thread.
     if asset_type == "hdris":
-        world = bpy.context.scene.world
-        if world is None:
-            world = bpy.data.worlds.new("World")
-            bpy.context.scene.world = world
-        world.use_nodes = True
-        env_tex_node = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
-        env_tex_node.image = bpy.data.images.load(dest)
-        bg_node = (
-            world.node_tree.nodes.get("Background")
-            or world.node_tree.nodes.new("ShaderNodeBackground")
-        )
-        world.node_tree.links.new(
-            env_tex_node.outputs["Color"], bg_node.inputs["Color"]
-        )
-        return {"hdri_applied": asset_id, "file": dest, "world": world.name}
+        def _apply_hdri() -> Dict[str, Any]:
+            world = bpy.context.scene.world
+            if world is None:
+                world = bpy.data.worlds.new("World")
+                bpy.context.scene.world = world
+            world.use_nodes = True
+            env_tex_node = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
+            env_tex_node.image = bpy.data.images.load(dest)
+            bg_node = (
+                world.node_tree.nodes.get("Background")
+                or world.node_tree.nodes.new("ShaderNodeBackground")
+            )
+            world.node_tree.links.new(
+                env_tex_node.outputs["Color"], bg_node.inputs["Color"]
+            )
+            return {"hdri_applied": asset_id, "file": dest, "world": world.name}
+
+        return _run_on_main_thread(_apply_hdri)
     else:
         return {
             "downloaded": asset_id,
@@ -472,6 +622,20 @@ HANDLERS = {
 }
 
 
+# Commands that never touch bpy: keep them on the worker thread so blocking
+# network I/O doesn't freeze Blender's UI. Everything else is marshalled to the
+# main thread. (download_polyhaven_asset is listed here because it downloads on
+# the worker thread and marshals only its bpy section - see the handler.)
+WORKER_THREAD_COMMANDS = {
+    "get_polyhaven_categories",
+    "search_polyhaven_assets",
+    "download_polyhaven_asset",
+    "set_llm_provider",
+    "get_llm_provider",
+    "get_ollama_models",
+}
+
+
 def _dispatch(command_type: str, params: Dict) -> bytes:
     """Route a command to its handler and return encoded response bytes."""
     handler = HANDLERS.get(command_type)
@@ -480,8 +644,11 @@ def _dispatch(command_type: str, params: Dict) -> bytes:
             f"Unknown command '{command_type}'. Available: {list(HANDLERS)}"
         )
     try:
-        # Blender operators must run on the main thread; we use a modal timer
-        result = handler(params)
+        if command_type in WORKER_THREAD_COMMANDS:
+            result = handler(params)
+        else:
+            # bpy is not thread safe: run the handler on Blender's main thread.
+            result = _run_on_main_thread(lambda: handler(params))
         return _ok(result)
     except Exception as exc:
         tb = traceback.format_exc()
@@ -563,6 +730,9 @@ class BLENDER_MCP_OT_StartServer(bpy.types.Operator):
             return {"CANCELLED"}
 
         prefs = context.scene.blender_mcp_props
+        # Start the main-thread pump before accepting connections, so the first
+        # command already has somewhere to hand its bpy work.
+        _start_main_thread_pump()
         _server_running = True
         _server_thread = threading.Thread(
             target=_server_loop,
@@ -592,6 +762,7 @@ class BLENDER_MCP_OT_StopServer(bpy.types.Operator):
         if _server_thread:
             _server_thread.join(timeout=3.0)
             _server_thread = None
+        _stop_main_thread_pump()
         self.report({"INFO"}, "MCP server stopped.")
         return {"FINISHED"}
 
@@ -681,6 +852,7 @@ def register():
 def unregister():
     global _server_running
     _server_running = False
+    _stop_main_thread_pump()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.blender_mcp_props
