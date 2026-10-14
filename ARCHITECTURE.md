@@ -36,14 +36,18 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
   classes: `BlenderMCPProperties` (host/port on the Scene),
   `BLENDER_MCP_OT_StartServer` / `BLENDER_MCP_OT_StopServer`, and the
   `BLENDER_MCP_PT_Panel` in the 3D View sidebar.
-- `_server_loop()` binds a TCP socket (default `localhost:9876`) and accepts
-  connections in daemon threads.
-- `_handle_client()` reads until `\n`, parses JSON, and calls `_dispatch()`.
+- `_start_server()` binds a nonblocking TCP socket (default `localhost:9876`)
+  and registers `_process_server_requests()` with `bpy.app.timers`.
+- The timer callback advances accept/read/write state for each connection. It
+  parses one newline-terminated JSON request and calls `_dispatch()` from
+  Blender's timer execution context; no Python worker threads are created.
 - `_dispatch()` looks up `HANDLERS[type]`, runs the handler, and returns
-  `_ok(result)` / `_err(message)` as newline-terminated JSON.
-- Handlers run directly (threaded). Blender operator execution (`bpy.ops`) is
-  invoked inside handlers; the panel/operator layer drives the server lifecycle
-  from the UI thread.
+  `_ok(result)` / `_err(message)` as newline-terminated JSON. Responses are
+  written incrementally to nonblocking sockets before each connection closes.
+- A request JSON line is limited to 8 MiB; larger payloads are rejected and
+  must be represented by a smaller request before sending.
+- The panel/operator layer starts and stops the listener on Blender's main
+  thread. Long-running handlers still run synchronously in the timer callback.
 - `HANDLERS` currently includes: get_scene_info, get_object_info,
   create_object, modify_object, delete_object, set_material, render_image,
   execute_blender_code, get_polyhaven_categories, search_polyhaven_assets,
@@ -119,8 +123,9 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 1. Agent calls `blender_create_object(primitive_type="SPHERE", ...)`.
 2. Server tool builds `cmd_params` and calls `_send_blender_command()`.
 3. A TCP connection sends `{"type": "create_object", "params": {...}}\n`.
-4. `addon.py` reads the line, `_dispatch()` runs the handler, bpy creates the
-   object, and the response `{"status":"ok","result":{...}}` is returned.
+4. The add-on timer reads the line, `_dispatch()` runs the handler in Blender's
+   execution context, bpy creates the object, and the response
+   `{"status":"ok","result":{...}}` is returned.
 5. The server formats the result and returns a string to the MCP client.
 
 ## Data flow — AI prompt
@@ -134,7 +139,8 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 ## State management
 - `_llm_state` (server) — single source of truth for the active provider
   config; mutated by `blender_set_llm_provider` and startup args.
-- Add-on server state (`_server_running`, socket, thread) — Blender side only.
+- Add-on server state (`_server_running`, listener, and client socket buffers) —
+  Blender side only.
 
 ## Security model
 - The add-on binds `localhost` by default; Blender side has no auth token in
@@ -155,9 +161,9 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 ## Tests proving the layers
 - `tests/test_integration.py` runs an in-process `fastmcp.Client` session
   against the server FastMCP instance (list/call tools, list/get prompts) and
-  boots the real `addon.py` TCP loop on a local port to round-trip bridge
-  commands (`blender_get_scene_info`, `blender_execute_code`) over a real
-  socket with bpy mocked.
+  pumps the timer-driven `addon.py` TCP loop on a local port to round-trip
+  bridge commands (`blender_get_scene_info`, `blender_execute_code`) over a
+  real socket with bpy mocked.
 
 ## Known gaps / notes
 - Runtime tests mock Blender and providers; a real Blender end-to-end pass is
@@ -165,5 +171,5 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 - Azure model listing is intentionally unsupported (deployments are portal
   managed).
 - `addon.py` doesn't yet implement auth tokens on the TCP socket; if you bind
-  to non-loopback interfaces, add authentication to `_handle_client` and the
-  matching token field to `_send_blender_command`.
+  to non-loopback interfaces, add authentication to the timer-driven request
+  handler and the matching token field to `_send_blender_command`.
