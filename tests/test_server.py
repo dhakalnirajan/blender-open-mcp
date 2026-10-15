@@ -199,11 +199,13 @@ class TestToolInputValidation:
         assert "Error" in result
 
     @pytest.mark.asyncio
-    async def test_scene_info_error_when_no_blender(self):
+    async def test_scene_info_error_when_no_blender(self, monkeypatch):
         """Without Blender running, tool returns a friendly error string."""
-        from blender_open_mcp.server import blender_get_scene_info
+        import blender_open_mcp.server as server
 
-        result = await blender_get_scene_info()
+        monkeypatch.setattr(server, "BLENDER_HOST", "127.0.0.1")
+        monkeypatch.setattr(server, "BLENDER_PORT", 1)
+        result = await server.blender_get_scene_info()
         assert "Cannot connect to Blender" in result
 
 

@@ -87,11 +87,11 @@ startup (CLI/env) and switched at runtime through MCP tools.
   lmstudio / llamacpp, provider state switching, tool registration/annotations,
   and PolyHaven pagination — all without Blender.
 - Addon tests mock `bpy` at import time (see `tests/test_addon.py`) and test
-  handlers/dispatch directly; they don't start a TCP server.
+  handlers/dispatch plus the timer-driven socket state machine.
 - Client tests mock the MCP HTTP layer.
 - `tests/test_integration.py` proves the wiring: an in-process `fastmcp.Client`
-  against the server (tools + prompts), and the real `addon.py` TCP loop driven
-  over a socket by the server bridge.
+  against the server (tools + prompts), and the timer-driven `addon.py` TCP
+  loop pumped by the test harness over a socket by the server bridge.
 - Manual end-to-end: start the add-on in Blender, run
   `blender-mcp --transport http`, then
   `blender-mcp-client --host http://localhost:8000 tool blender_get_scene_info`.

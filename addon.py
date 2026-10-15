@@ -11,6 +11,7 @@ Protocol (JSON over TCP, newline-terminated):
   Request : {"type": "<command>", "params": {...}}
   Response: {"status": "ok", "result": <any>}
            {"status": "error", "message": "<reason>"}
+  Limit   : request JSON line must not exceed 8 MiB.
 """
 
 bl_info = {
@@ -28,7 +29,7 @@ import json
 import math
 import os
 import socket
-import threading
+import time
 import traceback
 import urllib.request
 from typing import Any, Dict, Optional
@@ -41,14 +42,17 @@ DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 SOCKET_TIMEOUT = 60.0
 RECV_BUFFER = 8192
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_CLIENTS = 16
+SERVER_POLL_INTERVAL = 0.05
 
 
 # ---------------------------------------------------------------------------
 # Global server state
 # ---------------------------------------------------------------------------
 _server_socket: Optional[socket.socket] = None
-_server_thread: Optional[threading.Thread] = None
 _server_running = False
+_server_clients: Dict[socket.socket, Dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -473,14 +477,13 @@ HANDLERS = {
 
 
 def _dispatch(command_type: str, params: Dict) -> bytes:
-    """Route a command to its handler and return encoded response bytes."""
+    """Run a command handler and return its encoded response."""
     handler = HANDLERS.get(command_type)
     if handler is None:
         return _err(
             f"Unknown command '{command_type}'. Available: {list(HANDLERS)}"
         )
     try:
-        # Blender operators must run on the main thread; we use a modal timer
         result = handler(params)
         return _ok(result)
     except Exception as exc:
@@ -488,60 +491,131 @@ def _dispatch(command_type: str, params: Dict) -> bytes:
         return _err(f"{type(exc).__name__}: {exc}\n{tb}")
 
 
-def _handle_client(conn: socket.socket, addr) -> None:
-    """Handle a single client TCP connection."""
+def _close_client(conn: socket.socket) -> None:
+    _server_clients.pop(conn, None)
     try:
-        conn.settimeout(SOCKET_TIMEOUT)
-        data = b""
-        while True:
-            chunk = conn.recv(RECV_BUFFER)
-            if not chunk:
-                break
-            data += chunk
-            if b"\n" in data:
-                break
-        if not data:
-            return
-        message = json.loads(data.decode("utf-8").strip())
-        cmd_type = message.get("type", "")
-        cmd_params = message.get("params", {})
-        response = _dispatch(cmd_type, cmd_params)
-        conn.sendall(response)
-    except json.JSONDecodeError as exc:
-        conn.sendall(_err(f"Invalid JSON: {exc}"))
-    except Exception as exc:
-        conn.sendall(_err(f"Server error: {exc}"))
-    finally:
         conn.close()
+    except OSError:
+        pass
 
 
-def _server_loop(host: str, port: int) -> None:
-    """Main TCP server loop running in a background thread."""
+def _stop_server() -> None:
+    """Close the listener and clients; this function runs on Blender's main thread."""
     global _server_socket, _server_running
-    try:
-        _server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        _server_socket.bind((host, port))
-        _server_socket.listen(5)
-        _server_socket.settimeout(1.0)  # Allow periodic checks for _server_running
-
-        print(f"[Blender MCP] TCP server listening on {host}:{port}")
-        while _server_running:
-            try:
-                conn, addr = _server_socket.accept()
-                t = threading.Thread(
-                    target=_handle_client, args=(conn, addr), daemon=True
-                )
-                t.start()
-            except socket.timeout:
-                continue
-    except Exception as exc:
-        print(f"[Blender MCP] Server error: {exc}")
-    finally:
-        if _server_socket:
+    _server_running = False
+    for conn in list(_server_clients):
+        _close_client(conn)
+    if _server_socket is not None:
+        try:
             _server_socket.close()
-            _server_socket = None
-        print("[Blender MCP] TCP server stopped.")
+        except OSError:
+            pass
+        _server_socket = None
+    if bpy.app.timers.is_registered(_process_server_requests):
+        bpy.app.timers.unregister(_process_server_requests)
+
+
+def _start_server(host: str, port: int) -> None:
+    """Bind a nonblocking listener and poll it from Blender's application timer."""
+    global _server_socket, _server_running
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, port))
+        listener.listen(MAX_CLIENTS)
+        listener.setblocking(False)
+        if not bpy.app.timers.is_registered(_process_server_requests):
+            bpy.app.timers.register(
+                _process_server_requests,
+                first_interval=SERVER_POLL_INTERVAL,
+                persistent=True,
+            )
+    except Exception:
+        listener.close()
+        raise
+    _server_clients.clear()
+    _server_socket = listener
+    _server_running = True
+    print(f"[Blender MCP] TCP server listening on {host}:{port}")
+
+
+def _process_server_requests():
+    """Advance nonblocking TCP connections and run commands in Blender's timer context."""
+    if not _server_running or _server_socket is None:
+        return None
+
+    now = time.monotonic()
+    accepted = 0
+    while len(_server_clients) < MAX_CLIENTS and accepted < MAX_CLIENTS:
+        try:
+            conn, _addr = _server_socket.accept()
+        except BlockingIOError:
+            break
+        except OSError as exc:
+            print(f"[Blender MCP] Accept failed: {exc}")
+            _stop_server()
+            return None
+        try:
+            conn.setblocking(False)
+        except OSError:
+            conn.close()
+            continue
+        _server_clients[conn] = {
+            "buffer": bytearray(),
+            "response": None,
+            "sent": 0,
+            "deadline": now + SOCKET_TIMEOUT,
+        }
+        accepted += 1
+
+    for conn, state in list(_server_clients.items()):
+        if now >= state["deadline"]:
+            _close_client(conn)
+            continue
+        try:
+            if state["response"] is None:
+                try:
+                    chunk = conn.recv(RECV_BUFFER)
+                except BlockingIOError:
+                    chunk = None
+                if chunk == b"":
+                    _close_client(conn)
+                    continue
+                if chunk:
+                    state["buffer"].extend(chunk)
+                    newline = state["buffer"].find(b"\n")
+                    request_size = (
+                        newline if newline >= 0 else len(state["buffer"])
+                    )
+                    if request_size > MAX_REQUEST_BYTES:
+                        state["response"] = _err("Request exceeds maximum size.")
+                    elif newline >= 0:
+                        line = bytes(state["buffer"][:newline])
+                        try:
+                            message = json.loads(line.decode("utf-8").strip())
+                            state["response"] = _dispatch(
+                                message.get("type", ""), message.get("params", {})
+                            )
+                        except json.JSONDecodeError as exc:
+                            state["response"] = _err(f"Invalid JSON: {exc}")
+                        except Exception as exc:
+                            state["response"] = _err(f"Server error: {exc}")
+
+            response = state["response"]
+            if response is not None:
+                try:
+                    sent = conn.send(response[state["sent"] :])
+                except BlockingIOError:
+                    sent = 0
+                if sent == 0 and state["sent"] < len(response):
+                    continue
+                state["sent"] += sent
+                if state["sent"] >= len(response):
+                    _close_client(conn)
+        except OSError:
+            _close_client(conn)
+
+    return SERVER_POLL_INTERVAL if _server_running else None
 
 
 # ---------------------------------------------------------------------------
@@ -557,19 +631,16 @@ class BLENDER_MCP_OT_StartServer(bpy.types.Operator):
     )
 
     def execute(self, context: bpy.types.Context):
-        global _server_thread, _server_running
         if _server_running:
             self.report({"WARNING"}, "MCP server is already running.")
             return {"CANCELLED"}
 
         prefs = context.scene.blender_mcp_props
-        _server_running = True
-        _server_thread = threading.Thread(
-            target=_server_loop,
-            args=(prefs.server_host, prefs.server_port),
-            daemon=True,
-        )
-        _server_thread.start()
+        try:
+            _start_server(prefs.server_host, prefs.server_port)
+        except OSError as exc:
+            self.report({"ERROR"}, f"Could not start MCP server: {exc}")
+            return {"CANCELLED"}
         self.report(
             {"INFO"}, f"MCP server started on {prefs.server_host}:{prefs.server_port}"
         )
@@ -583,15 +654,11 @@ class BLENDER_MCP_OT_StopServer(bpy.types.Operator):
     bl_description = "Shut down the MCP TCP server"
 
     def execute(self, context: bpy.types.Context):
-        global _server_running, _server_thread
         if not _server_running:
             self.report({"WARNING"}, "MCP server is not running.")
             return {"CANCELLED"}
 
-        _server_running = False
-        if _server_thread:
-            _server_thread.join(timeout=3.0)
-            _server_thread = None
+        _stop_server()
         self.report({"INFO"}, "MCP server stopped.")
         return {"FINISHED"}
 
@@ -679,8 +746,7 @@ def register():
 
 
 def unregister():
-    global _server_running
-    _server_running = False
+    _stop_server()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.blender_mcp_props
