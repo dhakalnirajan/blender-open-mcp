@@ -57,6 +57,10 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 
 ### MCP server (`src/blender_open_mcp/server.py`)
 - FastMCP instance named `blender_open_mcp`.
+- `_send_blender_command()` frames responses on the protocol's newline
+  terminator rather than waiting for EOF, so a crash mid-reply is distinguished
+  from a clean close; `ConnectionResetError` / `BrokenPipeError` surface as an
+  actionable "Blender reset the connection" message instead of a raw traceback.
 - **Blender tools** forward to the add-on via `_send_blender_command()`:
   - scene: `blender_get_scene_info`, `blender_get_object_info`
   - objects: `blender_create_object`, `blender_modify_object`,

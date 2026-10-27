@@ -301,11 +301,21 @@ and the MCP client wire format, so they run without Blender or a live LLM.
   `blender_get_scene_info` and `blender_execute_code` round-trip over a real
   socket;
 - a parity test pins every bridge command to a registered addon handler and
-  every `blender_*` tool to a registered MCP tool.
+  every `blender_*` tool to a registered MCP tool;
+- `TestMainThreadDispatch` in `tests/test_addon.py` covers the add-on's
+  main-thread marshalling: bpy handlers run on the timer pump rather than the
+  connection thread, errors propagate back to the caller, network-only commands
+  stay on the worker thread, and a stopped pump releases blocked workers.
 
 ## Notes / known gaps
 
 - Tests exercise the server without a live Blender; run them against a real
   Blender session to validate `addon.py` end to end.
+- Blender API calls are executed on Blender's main thread via a
+  `bpy.app.timers` pump, so scene commands are serialised: a long render or a
+  heavy `blender_execute_code` build delays whatever is queued behind it.
+  PolyHaven downloads and LLM calls stay on worker threads and don't block the
+  UI. If Blender is busy with a modal operator, commands wait rather than
+  running against an invalid context.
 - See `ARCHITECTURE.md` for the component diagram and `AGENTS.md` for
   contributor conventions.

@@ -114,18 +114,27 @@ def _send_blender_command(
         ValueError: if the response cannot be parsed.
     """
     payload = json.dumps({"type": command_type, "params": params or {}}) + "\n"
+    raw = ""
     try:
         with socket.create_connection(
             (BLENDER_HOST, BLENDER_PORT), timeout=BLENDER_TIMEOUT
         ) as sock:
             sock.sendall(payload.encode("utf-8"))
-            chunks: List[bytes] = []
-            while True:
+            # Responses are newline-terminated (see addon.py _ok/_err), so stop
+            # at the first "\n" instead of waiting for the peer to close. Waiting
+            # for EOF cannot tell a clean shutdown apart from a crash mid-reply.
+            buffer = bytearray()
+            while b"\n" not in buffer:
                 chunk = sock.recv(4096)
                 if not chunk:
-                    break
-                chunks.append(chunk)
-            raw = b"".join(chunks).decode("utf-8").strip()
+                    break  # peer closed; fall through with whatever arrived
+                buffer.extend(chunk)
+            raw = buffer.decode("utf-8").strip()
+        if not raw:
+            raise ValueError(
+                "Blender add-on closed the connection without sending a response. "
+                "Check Blender's system console for a traceback."
+            )
         response: Dict[str, Any] = json.loads(raw)
         return response
     except ConnectionRefusedError:
@@ -133,6 +142,13 @@ def _send_blender_command(
             f"Cannot connect to Blender add-on at {BLENDER_HOST}:{BLENDER_PORT}. "
             "Make sure Blender is open with the Blender MCP add-on enabled and the "
             "server started (N-key sidebar -> Blender MCP -> Start MCP Server)."
+        )
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        raise ConnectionError(
+            f"Blender reset the connection while handling '{command_type}' "
+            f"({type(exc).__name__}). Blender may have crashed or become "
+            "unresponsive; check its system console and restart the MCP server "
+            "from the sidebar."
         )
     except socket.timeout:
         raise TimeoutError(
@@ -155,7 +171,8 @@ def _format_blender_result(response: Dict[str, Any]) -> str:
 
 def _handle_blender_error(exc: Exception) -> str:
     """Produce a friendly, actionable error string from common exceptions."""
-    if isinstance(exc, (ConnectionRefusedError, TimeoutError, ValueError)):
+    # ConnectionError covers refused/reset/broken-pipe alike.
+    if isinstance(exc, (ConnectionError, TimeoutError, ValueError)):
         return str(exc)
     return (
         f"Unexpected error communicating with Blender: {type(exc).__name__}: {exc}. "
