@@ -5,8 +5,8 @@ These prove the four layers work together without a real Blender or LLM:
 
 1. MCP  - a real fastmcp Client session (prompts/list, prompts/get,
           tools/list, tools/call) against the server's FastMCP instance.
-2. Addon - the actual addon.py TCP server loop is started on a local port
-          with bpy mocked, and driven through the MCP server's Blender
+2. Addon - the timer-driven addon.py TCP server loop is pumped on a local
+          port with bpy mocked, and driven through the MCP server's Blender
           bridge (_send_blender_command) over a real socket.
 """
 
@@ -189,8 +189,7 @@ class TestMCPEndToEnd:
 
 @pytest.fixture()
 def addon_server():
-    """Start addon.py's real TCP server loop with bpy mocked; yield and stop."""
-    addon._server_running = True
+    """Pump addon.py's timer server with bpy mocked; yield and stop."""
     host, port = "127.0.0.1", _free_port()
 
     # Mock the Blender scene context used by handlers.
@@ -211,26 +210,25 @@ def addon_server():
     addon.bpy.context.scene = scene
     addon.bpy.data.objects = mock_objects
 
-    thread = threading.Thread(
-        target=addon._server_loop, args=(host, port), daemon=True
-    )
-    thread.start()
+    addon.bpy.app.timers.is_registered.return_value = False
+    addon._start_server(host, port)
 
-    # Wait for the socket to accept connections.
+    def pump_timer():
+        while addon._server_running:
+            if addon._process_server_requests() is None:
+                return
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=pump_timer, daemon=True)
+    thread.start()
     deadline = time.time() + 5.0
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=0.5):
-                break
-        except OSError:
-            time.sleep(0.05)
+    while time.time() < deadline and addon._server_socket is None:
+        time.sleep(0.01)
 
     yield host, port
 
-    addon._server_running = False
+    addon._stop_server()
     thread.join(timeout=3.0)
-    addon._server_thread = None
-    addon._server_socket = None
 
 
 @pytest.mark.asyncio

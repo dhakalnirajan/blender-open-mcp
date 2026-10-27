@@ -7,7 +7,8 @@ LLM backends and runtime provider switching. These tests reflect that.
 
 import sys
 import os
-import threading
+import json
+import select
 import time
 import unittest
 from unittest.mock import patch, MagicMock
@@ -189,6 +190,192 @@ class TestAddonDispatch(unittest.TestCase):
         finally:
             if original_handler:
                 addon.HANDLERS["get_scene_info"] = original_handler
+
+
+class TestAddonTimerServer(unittest.TestCase):
+    """Exercise the nonblocking socket state machine without Blender threads."""
+
+    def setUp(self):
+        self.timer_api = addon.bpy.app.timers
+        self.registered = patch.object(
+            self.timer_api, "is_registered", return_value=False
+        )
+        self.registered.start()
+        probe = addon.socket.socket(addon.socket.AF_INET, addon.socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        self.host, self.port = probe.getsockname()
+        probe.close()
+        addon._start_server(self.host, self.port)
+
+    def tearDown(self):
+        addon._stop_server()
+        self.registered.stop()
+
+    def _connect(self):
+        client = addon.socket.create_connection((self.host, self.port), timeout=1)
+        client.settimeout(1)
+        return client
+
+    def _pump_and_read_response(self, client):
+        deadline = time.monotonic() + 1
+        chunks = []
+        while time.monotonic() < deadline:
+            addon._process_server_requests()
+            ready, _, _ = select.select([client], [], [], 0.01)
+            if ready:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        self.fail("timer server did not return a response")
+
+    def test_timer_handles_fragmented_request_and_dispatches_once(self):
+        handler = MagicMock(return_value={"ok": True})
+        original = addon.HANDLERS.get("timer_test")
+        addon.HANDLERS["timer_test"] = handler
+        client = self._connect()
+        try:
+            client.sendall(b'{"type":"timer_test",')
+            addon._process_server_requests()
+            client.sendall(b'"params":{"value":1}}\n')
+            response = json.loads(self._pump_and_read_response(client))
+            self.assertEqual(response, {"status": "ok", "result": {"ok": True}})
+            handler.assert_called_once_with({"value": 1})
+        finally:
+            client.close()
+            if original is None:
+                addon.HANDLERS.pop("timer_test", None)
+            else:
+                addon.HANDLERS["timer_test"] = original
+
+    def test_timer_returns_invalid_json_error(self):
+        client = self._connect()
+        try:
+            client.sendall(b"{invalid}\n")
+            response = json.loads(self._pump_and_read_response(client))
+            self.assertEqual(response["status"], "error")
+            self.assertIn("Invalid JSON", response["message"])
+        finally:
+            client.close()
+
+    def test_request_at_size_limit_is_accepted(self):
+        line = b'{"type":"size_test"}'
+        handler = MagicMock(return_value={"ok": True})
+        original = addon.HANDLERS.get("size_test")
+        addon.HANDLERS["size_test"] = handler
+        client = self._connect()
+        try:
+            with patch.object(addon, "MAX_REQUEST_BYTES", len(line)):
+                client.sendall(line + b"\n")
+                response = json.loads(self._pump_and_read_response(client))
+            self.assertEqual(response, {"status": "ok", "result": {"ok": True}})
+            handler.assert_called_once_with({})
+        finally:
+            client.close()
+            if original is None:
+                addon.HANDLERS.pop("size_test", None)
+            else:
+                addon.HANDLERS["size_test"] = original
+
+    def test_request_over_size_limit_returns_error(self):
+        client = self._connect()
+        try:
+            with patch.object(addon, "MAX_REQUEST_BYTES", 8):
+                client.sendall(b"123456789\n")
+                response = json.loads(self._pump_and_read_response(client))
+            self.assertEqual(response["status"], "error")
+            self.assertIn("maximum size", response["message"])
+        finally:
+            client.close()
+
+    def test_accepted_socket_setup_error_does_not_stop_timer(self):
+        class AcceptedSocket:
+            closed = False
+
+            def setblocking(self, _enabled):
+                raise OSError("socket closed during accept")
+
+            def close(self):
+                self.closed = True
+
+        class Listener:
+            def __init__(self, accepted):
+                self.accepted = accepted
+
+            def accept(self):
+                if self.accepted is not None:
+                    accepted, self.accepted = self.accepted, None
+                    return accepted, ("127.0.0.1", 12345)
+                raise BlockingIOError
+
+        old_socket = addon._server_socket
+        old_running = addon._server_running
+        old_clients = addon._server_clients
+        accepted = AcceptedSocket()
+        try:
+            addon._server_socket = Listener(accepted)
+            addon._server_running = True
+            addon._server_clients = {}
+            self.assertEqual(
+                addon._process_server_requests(), addon.SERVER_POLL_INTERVAL
+            )
+            self.assertTrue(accepted.closed)
+            self.assertEqual(addon._server_clients, {})
+        finally:
+            addon._server_socket = old_socket
+            addon._server_running = old_running
+            addon._server_clients = old_clients
+
+    def test_stop_closes_listener_and_connected_clients(self):
+        client = self._connect()
+        addon._process_server_requests()
+        self.assertTrue(addon._server_clients)
+        addon._stop_server()
+        self.assertFalse(addon._server_running)
+        self.assertFalse(addon._server_clients)
+        self.assertIsNone(addon._server_socket)
+        self.assertEqual(client.recv(1), b"")
+        client.close()
+
+    def test_timer_resumes_partial_response_send(self):
+        class PartialSocket:
+            def __init__(self):
+                self.output = bytearray()
+                self.closed = False
+
+            def send(self, data):
+                chunk = bytes(data[:3])
+                self.output.extend(chunk)
+                return len(chunk)
+
+            def close(self):
+                self.closed = True
+
+        conn = PartialSocket()
+        addon._server_clients[conn] = {
+            "buffer": bytearray(),
+            "response": b"abcdefgh\n",
+            "sent": 0,
+            "deadline": time.monotonic() + 1,
+        }
+        addon._process_server_requests()
+        self.assertEqual(bytes(conn.output), b"abc")
+        self.assertEqual(addon._server_clients[conn]["sent"], 3)
+        addon._process_server_requests()
+        addon._process_server_requests()
+        self.assertEqual(bytes(conn.output), b"abcdefgh\n")
+        self.assertTrue(conn.closed)
+        self.assertNotIn(conn, addon._server_clients)
+
+    def test_timer_closes_expired_partial_request(self):
+        client = self._connect()
+        client.sendall(b'{"type":')
+        addon._process_server_requests()
+        conn = next(iter(addon._server_clients))
+        addon._server_clients[conn]["deadline"] = 0
+        addon._process_server_requests()
+        self.assertNotIn(conn, addon._server_clients)
+        client.close()
 
 
 class TestAddonPolyHaven(unittest.TestCase):
